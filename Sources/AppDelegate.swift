@@ -8,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var statusItem: NSStatusItem!
     private var ticker: Timer?
     private var checkpoint: Timer?
+    private var round: WakeRound?
+    private var targetPanel: TimerPanel?
+    private var roundTicker: Timer?
+    private let pointerLocation: @MainActor () -> NSPoint
     private var store: StateStore!
     private var persistenceEnabled = true
     private var storageError: String?
@@ -15,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var largeSize = NSSize(width: 240, height: 112)
     private var countdownAnnounced = false
     private var isRestoring = true
+
+    init(pointerLocation: @escaping @MainActor () -> NSPoint = { NSEvent.mouseLocation }) {
+        self.pointerLocation = pointerLocation
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = ProcessInfo.processInfo.arguments
@@ -39,9 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                            width: min(480, max(144, placement.width)), height: min(240, max(56, placement.height)))
         }
         panel = TimerPanel(frame: visibleFrame(frame))
+        panel.onSpace = { [weak self] in self?.toggleTimer() }
         panel.delegate = self
         timerView = TimerView(target: self, play: #selector(toggleTimer), stop: #selector(stopTimer),
-                              reset: #selector(resetTimer), size: #selector(toggleSize))
+                              reset: #selector(resetTimer), size: #selector(toggleSize),
+                              wake: #selector(startWake), returnToStudy: #selector(returnToStudy))
         timerView.locked = locked
         timerView.buttons[3].isEnabled = !locked
         timerView.makeMenu = { [weak self] in self?.makeMenu() ?? NSMenu() }
@@ -79,11 +90,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        interruptWake()
         timer.pause()
         save()
     }
 
     @objc private func refresh() {
+        guard round == nil else { return }
         timerView?.refresh(timer: timer)
         if timer.mode == .countdown && timer.phase == .running && timer.elapsed >= timer.plannedSeconds {
             if !countdownAnnounced {
@@ -95,7 +108,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } else { countdownAnnounced = false }
     }
 
-    @objc private func toggleTimer() { timer.toggle(); changed() }
+    @objc private func startWake() {
+        guard round == nil, let screen = panel.screen else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let game = WakeRound(timer: timer, now: now, screen: screen.visibleFrame,
+                                   clock: panel.frame, pointer: pointerLocation()) else { return }
+        round = game
+        let size = WakeRound.diameter
+        let frame = NSRect(x: game.center.x - size / 2, y: game.center.y - size / 2, width: size, height: size)
+        let target = TimerPanel(frame: frame)
+        target.title = "清醒秒表"
+        target.ignoresMouseEvents = true
+        target.contentView = WakeTargetView(frame: NSRect(origin: .zero, size: frame.size))
+        targetPanel = target
+        target.orderFrontRegardless()
+        timerView.showRound(level: game.level, catches: game.catches, seconds: game.remaining(at: now))
+        save()
+        let pulse = Timer(timeInterval: 1.0 / 60, target: self, selector: #selector(advanceWake), userInfo: nil, repeats: true)
+        roundTicker = pulse
+        RunLoop.main.add(pulse, forMode: .common)
+    }
+
+    @objc private func advanceWake() {
+        guard let round, let targetPanel else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let old = round.center
+        round.advance(to: now, pointer: pointerLocation())
+        if round.outcome != nil {
+            closeWake()
+            return
+        }
+        if old != round.center {
+            let radius = WakeRound.diameter / 2
+            targetPanel.setFrameOrigin(NSPoint(x: round.center.x - radius, y: round.center.y - radius))
+        }
+        timerView.showRound(level: round.level, catches: round.catches, seconds: round.remaining(at: now))
+    }
+
+    @objc private func returnToStudy() { endWake(.returned) }
+    private func interruptWake() { endWake(.interrupted) }
+
+    private func endWake(_ reason: WakeRound.Outcome) {
+        guard let round else { return }
+        round.end(reason, at: ProcessInfo.processInfo.systemUptime)
+        closeWake()
+    }
+
+    private func closeWake() {
+        roundTicker?.invalidate()
+        roundTicker = nil
+        targetPanel?.close()
+        targetPanel = nil
+        round = nil
+        changed()
+    }
+
+    @objc private func toggleTimer() {
+        guard round == nil else { return }
+        timer.toggle()
+        changed()
+    }
     @objc private func stopTimer() { timer.finish(); changed() }
     @objc private func resetTimer() { timer.reset(); changed() }
     @objc private func undoReset() { timer.undoReset(); changed() }
@@ -128,11 +200,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
-    @objc private func willSleep() { timer.pause(); changed() }
-    @objc private func activeSpaceChanged() { panel.orderFrontRegardless() }
+    @objc private func willSleep() { interruptWake(); timer.pause(); changed() }
+    @objc private func activeSpaceChanged() {
+        panel.orderFrontRegardless()
+        targetPanel?.orderFrontRegardless()
+    }
     @objc private func screensChanged() {
         guard panel != nil else { return }
         let next = visibleFrame(panel.frame)
+        if let round, next != panel.frame || panel.screen?.frame.contains(round.playArea) != true {
+            interruptWake()
+        }
         if next != panel.frame { panel.setFrame(next, display: true) }
     }
 
@@ -177,12 +255,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func populate(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.autoenablesItems = false
+        if round != nil {
+            item(menu, "回到学习", #selector(returnToStudy))
+            item(menu, "退出悬浮计时", #selector(quit))
+            return
+        }
         item(menu, "实际学习  \(StudyTimer.format(seconds: timer.elapsed))", nil, enabled: false)
         item(menu, timer.phase == .running ? "暂停" : timer.phase == .paused ? "继续" : timer.phase == .finished ? "开始下一项" : "开始", #selector(toggleTimer))
         item(menu, "结束并记录", #selector(stopTimer), enabled: timer.phase == .running || timer.phase == .paused)
         item(menu, "复位", #selector(resetTimer), enabled: timer.phase != .ready)
         if timer.canUndoReset { item(menu, "撤销复位", #selector(undoReset)) }
         item(menu, "复制实际时长", #selector(copyCurrent))
+        item(menu, "清醒", #selector(startWake))
         menu.addItem(.separator())
         item(menu, "正计时", #selector(useStopwatch)).state = timer.mode == .stopwatch ? .on : .off
         item(menu, "倒计时", #selector(useCountdown)).state = timer.mode == .countdown ? .on : .off

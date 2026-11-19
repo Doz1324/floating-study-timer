@@ -1,8 +1,19 @@
 import AppKit
 
 final class TimerPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    var onSpace: (() -> Void)?
+    override var canBecomeKey: Bool { onSpace != nil }
     override var canBecomeMain: Bool { false }
+
+    override func sendEvent(_ event: NSEvent) {
+        if let onSpace, isKeyWindow, NSApp.modalWindow == nil,
+           event.type == .keyDown || event.type == .keyUp, event.keyCode == 49,
+           event.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty {
+            if event.type == .keyDown && !event.isARepeat { onSpace() }
+            return
+        }
+        super.sendEvent(event)
+    }
 
     init(frame: NSRect) {
         super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
@@ -13,7 +24,7 @@ final class TimerPanel: NSPanel {
                               .stationary, .ignoresCycle]
         isFloatingPanel = true
         hidesOnDeactivate = false
-        becomesKeyOnlyIfNeeded = true
+        becomesKeyOnlyIfNeeded = false
         worksWhenModal = true
         isOpaque = false
         backgroundColor = .clear
@@ -29,6 +40,10 @@ final class TimerPanel: NSPanel {
 /// Decorative text does not block dragging or the right-click menu.
 final class PassthroughLabel: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+private final class ReturnToStudyButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 final class TimerButton: NSButton {
@@ -95,13 +110,17 @@ final class TimerView: NSView {
     private(set) var buttons: [TimerButton] = []
     private var tracking: NSTrackingArea?
     private var renderedKey = ""
+    private let returnButton: NSButton
+    private var playing = false
     private(set) var hovered = false
     var locked = false { didSet { needsDisplay = true } }
     var makeMenu: (() -> NSMenu)?
     var toggleSize: (() -> Void)?
     var isCompact: Bool { bounds.height < 88 }
 
-    init(target: AnyObject, play: Selector, stop: Selector, reset: Selector, size: Selector) {
+    init(target: AnyObject, play: Selector, stop: Selector, reset: Selector, size: Selector,
+         wake: Selector, returnToStudy: Selector) {
+        returnButton = ReturnToStudyButton(title: "回到学习", target: target, action: returnToStudy)
         super.init(frame: .zero)
         timeLabel.alignment = .center
         timeLabel.maximumNumberOfLines = 1
@@ -112,10 +131,14 @@ final class TimerView: NSView {
             TimerButton(symbol: "play.fill", title: "开始", target: target, action: play),
             TimerButton(symbol: "stop.fill", title: "结束并记录", target: target, action: stop),
             TimerButton(symbol: "arrow.counterclockwise", title: "复位（可从右键菜单撤销）", target: target, action: reset),
-            TimerButton(symbol: "arrow.down.right.and.arrow.up.left", title: "迷你模式", target: target, action: size)
+            TimerButton(symbol: "arrow.down.right.and.arrow.up.left", title: "迷你模式", target: target, action: size),
+            TimerButton(symbol: "bolt.fill", title: "清醒", target: target, action: wake)
         ]
         buttons[0].primary = true
         buttons.forEach(addSubview)
+        returnButton.bezelStyle = .rounded
+        returnButton.isHidden = true
+        addSubview(returnButton)
         setAccessibilityRole(.group)
         setAccessibilityLabel("悬浮计时器；右键设置，拖动移动，右下角缩放")
     }
@@ -123,7 +146,26 @@ final class TimerView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    func showRound(level: Int, catches: Int, seconds: Int) {
+        let progress = "\(level)档 · \(catches)次 · \(seconds)秒"
+        guard !playing || timeLabel.stringValue != progress else { return }
+        playing = true
+        timeLabel.stringValue = progress
+        timeLabel.textColor = .white
+        timeLabel.setAccessibilityLabel("清醒模式，当前档位、触碰次数和剩余时间")
+        timeLabel.setAccessibilityValue(progress)
+        toolTip = "移动指针碰小秒表，每碰到 \(WakeRound.catchesPerLevel) 次升一档，最高五档"
+        renderedKey = ""
+        needsLayout = true
+        needsDisplay = true
+    }
+
     func refresh(timer: StudyTimer) {
+        if playing {
+            playing = false
+            timeLabel.setAccessibilityLabel("计时时间")
+            needsDisplay = true
+        }
         let key = "\(timer.display)|\(timer.phase.rawValue)|\(timer.mode.rawValue)|\(timer.plannedSeconds)|\(StudyTimer.format(seconds: timer.elapsed))"
         guard renderedKey != key else { return }
         renderedKey = key
@@ -138,7 +180,7 @@ final class TimerView: NSView {
         case .finished: status = "已结束并记录"
         }
         let mode = timer.mode == .stopwatch ? "正计时" : "倒计时 · \(Int(timer.plannedSeconds / 60)) 分钟"
-        toolTip = "\(mode) · \(status)\n实际学习 \(StudyTimer.format(seconds: timer.elapsed))\n右键设置 · 拖动移动 · 右下角缩放"
+        toolTip = "\(mode) · \(status)\n实际学习 \(StudyTimer.format(seconds: timer.elapsed))\n点时间后按空格开始或暂停 · 右键设置 · 拖动移动 · 右下角缩放"
         timeLabel.setAccessibilityValue("\(mode)，\(status)，\(timer.display)")
         let playTitle = timer.phase == .running ? "暂停" : timer.phase == .paused ? "继续" : timer.phase == .finished ? "开始下一项" : "开始"
         buttons[0].setSymbol(timer.phase == .running ? "pause.fill" : "play.fill", title: playTitle)
@@ -150,16 +192,21 @@ final class TimerView: NSView {
     override func layout() {
         super.layout()
         let compact = isCompact
-        let showControls = !compact || hovered
-        let gap: CGFloat = compact ? 8 : 12
-        let diameter: CGFloat = compact ? 22 : min(34, min(bounds.height * 0.28, (bounds.width - 28 - gap * 3) / 4))
-        let groupWidth = diameter * 4 + gap * 3
+        let showControls = playing || !compact || hovered
+        let gap = min(compact ? 6 : 10, max(3, (bounds.width - 128) / 4))
+        let count = CGFloat(buttons.count)
+        let diameter = min(compact ? 22 : min(34, bounds.height * 0.28),
+                           (bounds.width - 18 - gap * (count - 1)) / count)
+        let groupWidth = diameter * count + gap * (count - 1)
         let origin = (bounds.width - groupWidth) / 2
         for (i, button) in buttons.enumerated() {
-            button.isHidden = !showControls
+            button.isHidden = playing || !showControls
             button.frame = NSRect(x: origin + CGFloat(i) * (diameter + gap), y: compact ? 4 : 12,
                                   width: diameter, height: diameter)
         }
+        returnButton.isHidden = !playing
+        returnButton.frame = NSRect(x: (bounds.width - 94) / 2, y: compact ? 2 : 9, width: 94,
+                                    height: compact ? 24 : 30)
         buttons[3].setSymbol(compact ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left",
                              title: compact ? "展开" : "迷你模式")
         let availableHeight = compact ? (showControls ? bounds.height - 26 : bounds.height)
@@ -185,7 +232,7 @@ final class TimerView: NSView {
         NSColor(white: 1, alpha: 0.11).setStroke()
         shape.lineWidth = 1
         shape.stroke()
-        if hovered && !locked {
+        if hovered && !locked && !playing {
             NSColor(white: 1, alpha: 0.28).setStroke()
             let grip = NSBezierPath()
             for offset in [CGFloat(0), 4] {
@@ -218,7 +265,9 @@ final class TimerView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? { makeMenu?() }
 
     override func mouseDown(with event: NSEvent) {
-        guard let window, !locked else { return }
+        guard let window, !playing else { return }
+        window.makeKey()
+        guard !locked else { return }
         let point = convert(event.locationInWindow, from: nil)
         if point.x > bounds.width - 20 && point.y < 20 {
             let start = NSEvent.mouseLocation

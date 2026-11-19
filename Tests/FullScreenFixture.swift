@@ -1,7 +1,7 @@
 import AppKit
 
 @MainActor
-final class FixtureDelegate: NSObject, NSApplicationDelegate {
+final class FixtureDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
@@ -14,6 +14,7 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "全屏覆盖验证"
+        window.delegate = self
         window.collectionBehavior = [.fullScreenPrimary]
         window.backgroundColor = NSColor(srgbRed: 0.94, green: 0.95, blue: 0.96, alpha: 1)
         let label = NSTextField(labelWithString: "全屏覆盖验证")
@@ -38,6 +39,15 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if reportURL != nil { window.toggleFullScreen(nil) }
+    }
+    private var reportURL: URL? {
+        let args = CommandLine.arguments
+        guard args.count == 3, args[1] == "--report-fullscreen" else { return nil }
+        return URL(fileURLWithPath: args[2])
+    }
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        if let reportURL { try? String(window.windowNumber).write(to: reportURL, atomically: true, encoding: .utf8) }
     }
     @objc private func fullScreen() { window.toggleFullScreen(nil) }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

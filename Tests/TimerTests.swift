@@ -1,6 +1,6 @@
 import Foundation
 
-private final class Clock {
+final class Clock {
     var uptime: TimeInterval = 100
     var wall = Date(timeIntervalSince1970: 1_800_000_000)
     func advance(_ seconds: TimeInterval) { uptime += seconds; wall += seconds }
@@ -9,11 +9,11 @@ private final class Clock {
     }
 }
 
-private struct Failure: Error, CustomStringConvertible { let description: String }
-private func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+struct Failure: Error, CustomStringConvertible { let description: String }
+func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     if !condition() { throw Failure(description: message) }
 }
-private func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 0.00001 }
+func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 0.00001 }
 
 @main
 enum TimerTests {
@@ -122,7 +122,7 @@ enum TimerTests {
                 let unchanged = try String(contentsOf: url, encoding: .utf8)
                 try expect(unchanged == "invalid JSON", "原文件被改写")
             })
-        ]
+        ] + wakeCases
         var failures = 0
         for (name, body) in cases {
             do { try body(); print("PASS  \(name)") }
